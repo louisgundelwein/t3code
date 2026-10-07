@@ -1206,26 +1206,54 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     );
   });
 
+  // Git's in-progress pack files (`tmp_pack_*`, `tmp_idx_*`) in a pack directory.
+  const listTemporaryPackFiles = (packDir: string) =>
+    fileSystem.readDirectory(packDir).pipe(
+      Effect.map((names) => names.filter((name) => name.startsWith("tmp_"))),
+      Effect.orElseSucceed((): ReadonlyArray<string> => []),
+    );
+
   const fetchRemoteForStatus = (
     gitCommonDir: string,
     remoteName: string,
   ): Effect.Effect<void, GitCommandError> => {
     const fetchCwd =
       path.basename(gitCommonDir) === ".git" ? path.dirname(gitCommonDir) : gitCommonDir;
+    const packDir = path.join(gitCommonDir, "objects", "pack");
     // `--no-auto-gc` (a synonym of `--no-auto-maintenance` that older Git also knows) keeps
     // this poll from starting `git gc --auto`. When that gc fails, for example on a repository
     // with missing objects, Git retries it on every fetch and leaves a full-size `tmp_pack_*`
     // behind each time, so a background poll could fill the disk.
-    return executeGit(
-      "GitVcsDriver.fetchRemoteForStatus",
-      fetchCwd,
-      ["--git-dir", gitCommonDir, "fetch", "--quiet", "--no-tags", "--no-auto-gc", remoteName],
-      {
-        env: STATUS_UPSTREAM_REFRESH_ENV,
-        fallbackErrorDetail: "Background Git fetch exited with a non-zero status.",
-        timeoutMs: Duration.toMillis(STATUS_UPSTREAM_REFRESH_TIMEOUT),
-      },
-    ).pipe(Effect.asVoid);
+    // A fetch killed by the timeout also leaves its partial `tmp_pack_*` behind, even on
+    // SIGTERM. Until one fetch fits in the timeout, every retry downloads the backlog again, so
+    // a failed fetch removes the temporary pack files that appeared while it ran.
+    return listTemporaryPackFiles(packDir).pipe(
+      Effect.flatMap((existing) =>
+        executeGit(
+          "GitVcsDriver.fetchRemoteForStatus",
+          fetchCwd,
+          ["--git-dir", gitCommonDir, "fetch", "--quiet", "--no-tags", "--no-auto-gc", remoteName],
+          {
+            env: STATUS_UPSTREAM_REFRESH_ENV,
+            fallbackErrorDetail: "Background Git fetch exited with a non-zero status.",
+            timeoutMs: Duration.toMillis(STATUS_UPSTREAM_REFRESH_TIMEOUT),
+          },
+        ).pipe(
+          Effect.onError(() =>
+            listTemporaryPackFiles(packDir).pipe(
+              Effect.flatMap((current) =>
+                Effect.forEach(
+                  current.filter((name) => !existing.includes(name)),
+                  (name) => fileSystem.remove(path.join(packDir, name)).pipe(Effect.ignore),
+                  { discard: true },
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+      Effect.asVoid,
+    );
   };
 
   const resolveRepositoryPathsUncached = Effect.fn("resolveRepositoryPathsUncached")(function* (

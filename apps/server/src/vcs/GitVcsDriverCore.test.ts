@@ -821,6 +821,79 @@ it.effect("backs off and logs failed fetch attempts across linked worktrees", ()
   ).pipe(Effect.provide(layerServerConfig.pipe(Layer.provideMerge(NodeServices.layer)))),
 );
 
+it.effect("removes the partial pack a timed-out status fetch leaves behind", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const pathService = yield* Path.Path;
+      const cwd = yield* makeTmpDir();
+      const remote = yield* makeTmpDir("git-vcs-driver-remote-");
+      const packDir = pathService.join(cwd, ".git", "objects", "pack");
+      const fetchStarted = yield* Deferred.make<void>();
+      // Stands in for a fetch whose index-pack is still writing when the timeout kills it.
+      const hangingFetchSpawner = ChildProcessSpawner.make((command) =>
+        Effect.gen(function* () {
+          if (!ChildProcess.isStandardCommand(command)) {
+            return yield* Effect.die("expected a standard Git command");
+          }
+          if (command.args.includes("fetch") && command.args.includes("--quiet")) {
+            yield* fileSystem.writeFileString(pathService.join(packDir, "tmp_pack_timed_out"), "");
+            yield* Deferred.succeed(fetchStarted, undefined);
+            return ChildProcessSpawner.makeHandle({
+              pid: ChildProcessSpawner.ProcessId(1),
+              exitCode: Effect.never,
+              isRunning: Effect.succeed(true),
+              kill: () => Effect.void,
+              unref: Effect.succeed(Effect.void),
+              stdin: Sink.drain,
+              stdout: Stream.empty,
+              stderr: Stream.empty,
+              all: Stream.empty,
+              getInputFd: () => Sink.drain,
+              getOutputFd: () => Stream.empty,
+            });
+          }
+          return yield* delegate.spawn(command);
+        }),
+      );
+      const driver = yield* makeGitVcsDriverCore().pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, hangingFetchSpawner),
+      );
+      const runGit = (workingDirectory: string, args: ReadonlyArray<string>) =>
+        driver.execute({
+          operation: "GitVcsDriver.test.statusFetchTimeoutCleanup",
+          cwd: workingDirectory,
+          args,
+          timeoutMs: 10_000,
+        });
+
+      yield* driver.initRepo({ cwd });
+      yield* runGit(cwd, ["config", "user.email", "test@test.com"]);
+      yield* runGit(cwd, ["config", "user.name", "Test"]);
+      yield* writeTextFile(cwd, "README.md", "# test\n");
+      yield* runGit(cwd, ["add", "."]);
+      yield* runGit(cwd, ["commit", "-m", "initial commit"]);
+      const initialBranch = (yield* runGit(cwd, ["branch", "--show-current"])).stdout.trim();
+      yield* runGit(remote, ["init", "--bare"]);
+      yield* runGit(cwd, ["remote", "add", "origin", remote]);
+      yield* runGit(cwd, ["push", "-u", "origin", initialBranch]);
+      // A partial pack that was already there belongs to some other fetch and must survive.
+      yield* fileSystem.writeFileString(pathService.join(packDir, "tmp_pack_other"), "");
+
+      const status = yield* driver.statusDetailsRemote(cwd).pipe(Effect.forkChild);
+      yield* Deferred.await(fetchStarted);
+      yield* TestClock.adjust("5 seconds");
+      yield* Fiber.join(status);
+
+      const temporaryPacks = (yield* fileSystem.readDirectory(packDir)).filter((name) =>
+        name.startsWith("tmp_"),
+      );
+      assert.deepStrictEqual(temporaryPacks, ["tmp_pack_other"]);
+    }),
+  ).pipe(Effect.provide(layerServerConfig.pipe(Layer.provideMerge(NodeServices.layer)))),
+);
+
 it.effect.each([
   {
     name: "HTTPS credentials",
