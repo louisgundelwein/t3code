@@ -821,7 +821,18 @@ it.effect("backs off and logs failed fetch attempts across linked worktrees", ()
   ).pipe(Effect.provide(layerServerConfig.pipe(Layer.provideMerge(NodeServices.layer)))),
 );
 
-it.effect("removes the partial pack a timed-out status fetch leaves behind", () =>
+it.effect.each([
+  {
+    name: "removes the partial pack a timed-out status fetch leaves behind",
+    baselineListingFails: false,
+    expected: ["tmp_pack_other"],
+  },
+  {
+    name: "keeps every partial pack when the pre-fetch listing fails",
+    baselineListingFails: true,
+    expected: ["tmp_pack_other", "tmp_pack_timed_out"],
+  },
+])("$name", ({ baselineListingFails, expected }) =>
   Effect.scoped(
     Effect.gen(function* () {
       const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -831,6 +842,25 @@ it.effect("removes the partial pack a timed-out status fetch leaves behind", () 
       const remote = yield* makeTmpDir("git-vcs-driver-remote-");
       const packDir = pathService.join(cwd, ".git", "objects", "pack");
       const fetchStarted = yield* Deferred.make<void>();
+      const failNextPackListing = yield* Ref.make(false);
+      // Fails one pack directory listing on demand, like a transient EMFILE or EACCES.
+      const flakyFileSystem = {
+        ...fileSystem,
+        readDirectory: (directory, options) =>
+          Effect.gen(function* () {
+            // The driver lists the real path of the pack directory, so match its suffix.
+            const isPackDir = directory.endsWith(pathService.join(".git", "objects", "pack"));
+            if (isPackDir && (yield* Ref.getAndSet(failNextPackListing, false))) {
+              return yield* PlatformError.systemError({
+                _tag: "PermissionDenied",
+                module: "FileSystem",
+                method: "readDirectory",
+                pathOrDescriptor: directory,
+              });
+            }
+            return yield* fileSystem.readDirectory(directory, options);
+          }),
+      } satisfies FileSystem.FileSystem;
       // Stands in for a fetch whose index-pack is still writing when the timeout kills it.
       const hangingFetchSpawner = ChildProcessSpawner.make((command) =>
         Effect.gen(function* () {
@@ -859,6 +889,7 @@ it.effect("removes the partial pack a timed-out status fetch leaves behind", () 
       );
       const driver = yield* makeGitVcsDriverCore().pipe(
         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, hangingFetchSpawner),
+        Effect.provideService(FileSystem.FileSystem, flakyFileSystem),
       );
       const runGit = (workingDirectory: string, args: ReadonlyArray<string>) =>
         driver.execute({
@@ -880,6 +911,7 @@ it.effect("removes the partial pack a timed-out status fetch leaves behind", () 
       yield* runGit(cwd, ["push", "-u", "origin", initialBranch]);
       // A partial pack that was already there belongs to some other fetch and must survive.
       yield* fileSystem.writeFileString(pathService.join(packDir, "tmp_pack_other"), "");
+      yield* Ref.set(failNextPackListing, baselineListingFails);
 
       const status = yield* driver.statusDetailsRemote(cwd).pipe(Effect.forkChild);
       yield* Deferred.await(fetchStarted);
@@ -889,7 +921,7 @@ it.effect("removes the partial pack a timed-out status fetch leaves behind", () 
       const temporaryPacks = (yield* fileSystem.readDirectory(packDir)).filter((name) =>
         name.startsWith("tmp_"),
       );
-      assert.deepStrictEqual(temporaryPacks, ["tmp_pack_other"]);
+      assert.deepStrictEqual(temporaryPacks.toSorted(), expected);
     }),
   ).pipe(Effect.provide(layerServerConfig.pipe(Layer.provideMerge(NodeServices.layer)))),
 );

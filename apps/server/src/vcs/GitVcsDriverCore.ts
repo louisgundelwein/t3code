@@ -1206,11 +1206,14 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     );
   });
 
-  // Git's in-progress pack files (`tmp_pack_*`, `tmp_idx_*`) in a pack directory.
+  // Git's in-progress pack files (`tmp_pack_*`, `tmp_idx_*`) in a pack directory. A missing
+  // directory has none; other read failures are returned to the caller.
   const listTemporaryPackFiles = (packDir: string) =>
     fileSystem.readDirectory(packDir).pipe(
       Effect.map((names) => names.filter((name) => name.startsWith("tmp_"))),
-      Effect.orElseSucceed((): ReadonlyArray<string> => []),
+      Effect.catchReason("PlatformError", "NotFound", () =>
+        Effect.succeed<ReadonlyArray<string>>([]),
+      ),
     );
 
   const fetchRemoteForStatus = (
@@ -1226,8 +1229,10 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     // behind each time, so a background poll could fill the disk.
     // A fetch killed by the timeout also leaves its partial `tmp_pack_*` behind, even on
     // SIGTERM. Until one fetch fits in the timeout, every retry downloads the backlog again, so
-    // a failed fetch removes the temporary pack files that appeared while it ran.
+    // a failed fetch removes the temporary pack files that appeared while it ran. Without a
+    // baseline listing it cannot tell which files those are, so it removes nothing.
     return listTemporaryPackFiles(packDir).pipe(
+      Effect.option,
       Effect.flatMap((existing) =>
         executeGit(
           "GitVcsDriver.fetchRemoteForStatus",
@@ -1240,15 +1245,18 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           },
         ).pipe(
           Effect.onError(() =>
-            listTemporaryPackFiles(packDir).pipe(
-              Effect.flatMap((current) =>
-                Effect.forEach(
-                  current.filter((name) => !existing.includes(name)),
-                  (name) => fileSystem.remove(path.join(packDir, name)).pipe(Effect.ignore),
-                  { discard: true },
+            Option.isNone(existing)
+              ? Effect.void
+              : listTemporaryPackFiles(packDir).pipe(
+                  Effect.flatMap((current) =>
+                    Effect.forEach(
+                      current.filter((name) => !existing.value.includes(name)),
+                      (name) => fileSystem.remove(path.join(packDir, name)).pipe(Effect.ignore),
+                      { discard: true },
+                    ),
+                  ),
+                  Effect.ignore,
                 ),
-              ),
-            ),
           ),
         ),
       ),
